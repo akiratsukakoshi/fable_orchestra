@@ -104,6 +104,10 @@ cp -r ~/fable_orchestra/skills/orch ~/.claude/skills/
 - [002 リファクタ提案の前に配備トポロジーを調べる](lessons/002-refactor-vs-deploy-topology.md) — 教科書的に正しい統合が本番を壊すことがある
 - [003 検収は報告を読むことではなく再検証すること](lessons/003-inspection-finds-real-bugs.md) — 検収が見つけるのは指令塔自身の設計の穴
 
+## ライセンス
+
+MIT License([LICENSE](LICENSE))
+
 ## 注意
 
 - モデル名(Fable / Opus / Sonnet)は執筆時点の Claude ラインナップ前提です。世代が変わっても「従量の最上位=指令塔、枠内=実行部隊」の構造は同じなので読み替えてください。
