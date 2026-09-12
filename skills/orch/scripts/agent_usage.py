@@ -1,35 +1,43 @@
 #!/usr/bin/env python3
-"""トークン実測+金額換算ツール(orch型 v0.4.2)。
+"""トークン実測+枠負荷($換算)ツール(orch型 v1.1、2026-09-12 サブスク転換対応)。
 
 3モード:
   (1) 委譲先実測:   agent_usage.py <transcript.jsonl> [<transcript2.jsonl> ...]
-      AgentツールのJSONLトランスクリプトからusageを集計(従来機能)。
-  (2) 指令塔実測:   agent_usage.py --main <session.jsonl>
-      メインセッションのJSONLをモデル別に集計し、USD金額も出す。
+      AgentツールのJSONLトランスクリプトからusageを集計。
+  (2) 指令塔実測:   agent_usage.py --main <session.jsonl> [--metered] [--weekly-usd N]
+      メインセッションのJSONLをモデル別に集計し、枠負荷($換算)を出す。
       セッションJSONLの場所: ~/.claude/projects/<cwdの/を-に置換>/ の最新 *.jsonl
-      (例: ls -t ~/.claude/projects/<cwdの/を-に置換>/*.jsonl | head -1)
+      (例: ls -t ~/.claude/projects/<cwdを-区切りにした名前>/*.jsonl | head -1)
   (3) 事前見積り:   agent_usage.py --estimate <Fableリクエスト数> [--ctx 145] [--cold 1] [--out 1.4]
-      着手前にFable指令塔コストのUSDレンジを出す(GO/NO-GO提示用)。--ctx/--outはk tok単位。
+      着手前にFable指令塔の枠負荷($換算)レンジを出す(GO/NO-GO提示用)。--ctx/--outはk tok単位。
+
+v1.1の単位について:
+- Maxプランでは Fable も週次枠の内側(50%上限・Opus比約2倍の重み)。金額は請求されないが、
+  枠の重みは単価に比例する、を作業仮説として USD換算値 = 「枠負荷」の指標に使う。
+- --metered: Fableの50%枠到達後にクレジット継続を承認した区間(=本当に従量)の実額表示に切り替える。
+- --weekly-usd N: 「週次枠100% = N ドル換算」の較正値。与えると 週次枠% と Fable枠(50%)% も表示する。
+  較正のとり方: セッション前後の /usage 差分(%) と本ツールの$換算を3〜5標本並べて N を決める。
 
 集計の注意(2026-07-05 実測で確定):
 - 同一message.idの行が複数ある(ストリーミング分割)ため、id単位で各usageフィールドのmaxを取る。
   出力トークンは累積更新されるので、初出値や単純合算では大幅に狂う(実測: 87.6k→7.8kに過小)。
-- 単価(USD/MTok): Fable $10/$50、Opus $5/$25、Sonnet $3/$15、Haiku $1/$5。
-  キャッシュ書込=入力単価×1.25(5分TTL)、読取=×0.1。1時間TTL書込は×2(要ダッシュボード照合)。
-- 枠内(サブスク)モデルの行は「枠内」と表示し、USDは従量換算の参考値。
+- 単価(USD/MTok、API公表値): Fable $10/$50(キャッシュ読取$0.25=Fable 5.1で改定)、Opus $5/$25、
+  Sonnet $3/$15、Haiku $1/$5。キャッシュ書込=入力単価×1.25(5分TTL)。読取は家族ごとの単価。
+  1時間TTL書込は×2(要ダッシュボード照合)。
 """
 import argparse
 import json
 import sys
 
-# USD per MTok: (input, output)。書込=input×1.25、読取=input×0.1
+# USD per MTok: (input, output, cache_read)。書込=input×1.25
 PRICES = {
-    "fable": (10.0, 50.0),
-    "opus": (5.0, 25.0),
-    "sonnet": (3.0, 15.0),
-    "haiku": (1.0, 5.0),
+    "fable": (10.0, 50.0, 0.25),
+    "opus": (5.0, 25.0, 0.50),
+    "sonnet": (3.0, 15.0, 0.30),
+    "haiku": (1.0, 5.0, 0.10),
 }
-METERED_FAMILIES = {"fable"}  # このプロジェクトで従量請求されるモデル
+TOP_FAMILIES = {"fable"}  # 週次枠の50%上限がかかる「重い」モデル(=指令塔候補)
+FABLE_SHARE = 0.5         # Fable枠 = 週次枠の50%
 
 
 def model_family(model: str) -> str:
@@ -41,11 +49,11 @@ def model_family(model: str) -> str:
 
 
 def usd(family: str, t: dict) -> float:
-    pin, pout = PRICES[family]
+    pin, pout, pread = PRICES[family]
     return (
         t["input"] * pin
         + t["cache_write"] * pin * 1.25
-        + t["cache_read"] * pin * 0.10
+        + t["cache_read"] * pread
         + t["output"] * pout
     ) / 1_000_000
 
@@ -93,10 +101,13 @@ def fmt(n) -> str:
     return f"{n/1000:.1f}k" if n >= 1000 else str(int(n))
 
 
-def print_row(name, t, family=None):
+def print_row(name, t, family=None, metered=False):
     cost = ""
     if family:
-        tag = "" if family in METERED_FAMILIES else "(枠内)"
+        if family in TOP_FAMILIES:
+            tag = "(従量)" if metered else "(Fable枠)"
+        else:
+            tag = "(共通枠)"
         cost = f" ${usd(family, t):>7.2f}{tag}"
     total = t["input"] + t["cache_write"] + t["cache_read"]
     print(f"{name:<30} {t['calls']:>5} {fmt(total):>9} {fmt(t['input']):>9} "
@@ -104,8 +115,16 @@ def print_row(name, t, family=None):
 
 
 def header(with_cost=False):
-    cost = f" {'USD':>8}" if with_cost else ""
+    cost = f" {'$換算':>8}" if with_cost else ""
     print(f"{'対象':<30} {'calls':>5} {'入力計':>8} {'非ｷｬｯｼｭ':>7} {'書込':>7} {'読取':>8} {'出力':>7}{cost}")
+
+
+def quota_lines(top_usd: float, all_usd: float, weekly_usd: float):
+    if not weekly_usd:
+        return
+    print(f"週次枠換算(較正値: 100%={weekly_usd:.0f}$換算): "
+          f"Fable枠 {top_usd / (weekly_usd * FABLE_SHARE) * 100:.1f}% (50%枠の内訳) / "
+          f"週次枠全体 {all_usd / weekly_usd * 100:.1f}%(全モデル)")
 
 
 def mode_subagents(paths):
@@ -120,32 +139,42 @@ def mode_subagents(paths):
         print_row("== 合算 ==", grand)
 
 
-def mode_main(path):
+def mode_main(path, metered=False, weekly_usd=None):
     by_model = collect(path)
     header(with_cost=True)
-    metered_total = 0.0
+    top_total = 0.0
+    all_total = 0.0
     for model in sorted(by_model):
         t = by_model[model]
         fam = model_family(model)
-        print_row(model[:28], t, family=fam)
-        if fam in METERED_FAMILIES:
-            metered_total += usd(fam, t)
-    print(f"\n従量(Fable)合計: ${metered_total:.2f}")
-    print("※書込は5分TTL(×1.25)換算。1hTTLなら書込×2で再計算。ダッシュボード実測と照合して較正する。")
+        print_row(model[:28], t, family=fam, metered=metered)
+        c = usd(fam, t)
+        all_total += c
+        if fam in TOP_FAMILIES:
+            top_total += c
+    label = "Fable従量(実額)合計" if metered else "Fable枠負荷($換算)合計"
+    print(f"\n{label}: ${top_total:.2f}   / 全モデル$換算: ${all_total:.2f}")
+    quota_lines(top_total, all_total, weekly_usd)
+    print("※書込は5分TTL(×1.25)換算。Fableのキャッシュ読取は$0.25/MTok(5.1改定)。"
+          "枠の重みは単価比例が作業仮説 — /usage の前後差分と照合して較正する。")
 
 
-def mode_estimate(requests, ctx_k, cold, out_k):
-    pin, pout = PRICES["fable"]
-    per_req = ctx_k * 1000 * pin * 0.10 / 1e6 + out_k * 1000 * pout / 1e6
+def mode_estimate(requests, ctx_k, cold, out_k, weekly_usd=None):
+    pin, pout, pread = PRICES["fable"]
+    per_req = ctx_k * 1000 * pread / 1e6 + out_k * 1000 * pout / 1e6
     cold_cost = ctx_k * 1000 * pin * 1.25 / 1e6
     point = requests * per_req + cold * cold_cost
     lo, hi = point * 0.7, point * 1.4
-    print(f"Fable指令塔 事前見積り(較正前 確度±30〜50%)")
+    print(f"Fable指令塔 事前見積り — 枠負荷($換算。較正前 確度±30〜50%)")
     print(f"  前提: リクエスト{requests}回 × (文脈{ctx_k:.0f}k読取 + 出力{out_k:.1f}k) "
           f"+ キャッシュ切れ{cold}回")
     print(f"  1リクエストあたり ≈ ${per_req:.2f} / キャッシュ切れ1回 ≈ ${cold_cost:.2f}")
     print(f"  → 概算 ${point:.1f}(レンジ ${lo:.1f}〜${hi:.1f})")
+    if weekly_usd:
+        print(f"  → Fable枠(週次50%)の {point / (weekly_usd * FABLE_SHARE) * 100:.1f}% 相当"
+              f"(較正値 100%={weekly_usd:.0f}$換算)")
     print(f"  リクエスト数の目安: 計画・委譲指示5〜8 + WPあたり検収3〜5 + 差し戻し1回3〜5")
+    print(f"  着手前に /usage のFable残%を確認し、逼迫なら(b)構成か翌週送りを提案する(skill §3)")
 
 
 def main():
@@ -153,15 +182,19 @@ def main():
     ap.add_argument("paths", nargs="*")
     ap.add_argument("--main", dest="main_path")
     ap.add_argument("--estimate", type=int)
-    ap.add_argument("--ctx", type=float, default=145.0, help="平均文脈 k tok(既定145=実測較正値)")
+    ap.add_argument("--ctx", type=float, default=145.0, help="平均文脈 k tok(既定145=実測例)")
     ap.add_argument("--cold", type=int, default=1, help="キャッシュ切れ想定回数")
     ap.add_argument("--out", type=float, default=1.4, help="1リクエスト平均出力 k tok")
+    ap.add_argument("--metered", action="store_true",
+                    help="Fable行を従量(実額)扱いで表示(50%枠到達後にクレジット継続を承認した区間用)")
+    ap.add_argument("--weekly-usd", type=float, default=None,
+                    help="較正値: 週次枠100%%のドル換算。与えると枠%%も表示")
     args = ap.parse_args()
 
     if args.estimate:
-        mode_estimate(args.estimate, args.ctx, args.cold, args.out)
+        mode_estimate(args.estimate, args.ctx, args.cold, args.out, args.weekly_usd)
     elif args.main_path:
-        mode_main(args.main_path)
+        mode_main(args.main_path, metered=args.metered, weekly_usd=args.weekly_usd)
     elif args.paths:
         mode_subagents(args.paths)
     else:

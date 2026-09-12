@@ -1,7 +1,8 @@
 #!/bin/bash
-# 降板ガード(Fable Orchestra 型 v0.4.3)
+# 降板ガード(Fable Orchestra 型 v0.4.3 / v1.1 文言更新 2026-09-12)
 # 降板フラグ(docs/orchestration/.fable-retired)があるプロジェクトで、
-# 従量モデル(Fable/Mythos)のままプロンプトを送るとブロックして切替を促す。
+# 最上位モデル(Fable/Mythos)のままプロンプトを送るとブロックして切替を促す。
+# v1.1以降の目的は課金防止ではなく「派生対話でFable枠(週次50%上限)を溶かさない」こと。
 # フラグ無し・モデルがOpus等ならそのまま通す(exit 0)。
 
 input=$(cat)
@@ -44,7 +45,7 @@ case "$model" in
   *fable*|*mythos*)
     {
       echo "⛔ 降板済みプロジェクトです(フラグ: $flag)"
-      echo "現在の指令塔は従量モデル($model)。このまま続けると1往復ごとに課金されます。"
+      echo "現在の指令塔は Fable($model)。このまま続けると往復ごとにFable枠(週次枠の50%上限・Opus比約2倍の重み)を消費します。"
       echo "→ /model opus に切り替えてから、同じメッセージを再送してください。"
       echo "→ 意図的にFableを再登板する場合はフラグを削除: rm '$flag'"
     } >&2
