@@ -1,19 +1,19 @@
 #!/bin/bash
-# 降板ガード(Fable Orchestra 型 v0.4.3 / v1.1 文言更新 2026-09-12)
+# 降板ガード(Fable Orchestra 型 v0.4.3 → v1.1で「警告のみ」に変更 2026-09-12)
 # 降板フラグ(docs/orchestration/.fable-retired)があるプロジェクトで、
-# 最上位モデル(Fable/Mythos)のままプロンプトを送るとブロックして切替を促す。
-# v1.1以降の目的は課金防止ではなく「派生対話でFable枠(週次50%上限)を溶かさない」こと。
-# フラグ無し・モデルがOpus等ならそのまま通す(exit 0)。
+# 最上位モデル(Fable/Mythos)のままプロンプトを送ると警告を表示する(ブロックはしない)。
+# 目的は課金防止ではなく「派生対話でFable枠(週次50%上限)を溶かしている」ことの可視化。
+# フラグ無し・モデルがOpus等・判定不能なら何も出さず通す(exit 0)。
 
 input=$(cat)
 
-read -r cwd sid tp <<EOF
+read -r cwd sid tp <<EOF2
 $(printf '%s' "$input" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 print(d.get('cwd',''), d.get('session_id',''), d.get('transcript_path',''))
 " 2>/dev/null)
-EOF
+EOF2
 
 [ -n "$cwd" ] || exit 0
 flag="$cwd/docs/orchestration/.fable-retired"
@@ -43,13 +43,21 @@ print(m)
 
 case "$model" in
   *fable*|*mythos*)
-    {
-      echo "⛔ 降板済みプロジェクトです(フラグ: $flag)"
-      echo "現在の指令塔は Fable($model)。このまま続けると往復ごとにFable枠(週次枠の50%上限・Opus比約2倍の重み)を消費します。"
-      echo "→ /model opus に切り替えてから、同じメッセージを再送してください。"
-      echo "→ 意図的にFableを再登板する場合はフラグを削除: rm '$flag'"
-    } >&2
-    exit 2
+    python3 - "$model" "$flag" <<'PY'
+import json, sys
+model, flag = sys.argv[1], sys.argv[2]
+msg = (f"⚠ Fable枠を使っています: このプロジェクトは降板済み(フラグ: {flag})ですが、"
+       f"指令塔は {model} のままです。派生対話なら /model opus への切替を検討してください"
+       f"(Fableは週次枠の50%上限・Opus比約2倍の重み)。意図的な再登板ならフラグを削除: rm '{flag}'")
+print(json.dumps({
+    "systemMessage": msg,
+    "hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": "[降板ガード] このプロジェクトは降板済み(.fable-retired あり)だが指令塔がFableのまま。"
+                             "返答の冒頭で一言、/model opus への切替(または再登板ならフラグ削除)を提案すること。ブロックはしない。"
+    }
+}, ensure_ascii=False))
+PY
     ;;
 esac
 exit 0
